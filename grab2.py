@@ -36,6 +36,9 @@ JLU 研究生选课助手 grab2.py （按 xsxkapp 前端协议 1:1 复刻版）
      轮次开放中但列表为空 = 已全部选完，提示后回车退出；wait_open=false 可关闭等待
   F. 会话恢复：选课系统会话过期 -> 自动重登；WebVPN 会话过期（JLU 登录有
      微信二次验证，无法自动登录）-> 提示手动贴新 Cookie，贴完自动继续并写回配置
+  G. 轮次未开放：自动挂机探测等开放。配置 "open_at"（下次开放时间，启动时选 o 可直接
+     设置）会挂机到开放前 open_lead 秒（默认 5 分钟）转 3 秒高频探测；未配置则按
+     "probe_gap"（默认 10 秒）间隔探测。探测带时间戳与已等待时长；等待中会话过期自动重登
 """
 import getpass
 import json
@@ -69,6 +72,8 @@ PAGE_SIZE = 500                       # 一次拉全部
 SUBMIT_GAP = 0.3
 # loadXkjgRes 单次任务最多查询轮数（结果随盯守轮询每轮查一次）
 MAX_POLL = 30
+# 轮次未开放时：距 open_at 还剩多久转 3 秒高频探测（默认提前 5 分钟）
+OPEN_LEAD = 300
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/139.0.0.0 Safari/537.36'
 # =======================================================
 
@@ -82,6 +87,11 @@ CHANNELS = {
 
 
 class CookieExpired(Exception):
+    pass
+
+
+class RoundNotOpen(Exception):
+    """轮次未开放（服务器返回“暂未开放选课”）——登录态正常，等开放即可"""
     pass
 
 
@@ -213,6 +223,10 @@ class XsxkClient:
                 cl = {'0': '可选可退', '1': '可选不可退', '2': '不可选可退'}.get(str(lc.get('XKCL')), str(lc.get('XKCL')))
                 print(f"  选课策略: {cl}")
         if not self.csrf:
+            msg = str(info.get('msg') or '')
+            if '未开放' in msg:
+                # 轮次未开放：登录态正常但不发 csrfToken，等开放即可
+                raise RoundNotOpen(msg)
             raise RuntimeError('未拿到 csrfToken，返回内容: ' + json.dumps(info, ensure_ascii=False)[:300])
         return self.csrf
 
@@ -335,6 +349,10 @@ def relogin(cli, base, cfg=None):
                     cfg['cookie'] = dump_cookie(cli)
                     save_config(cfg)  # 最新 Cookie 写回配置
                 return cli
+            except RoundNotOpen:
+                # 登录成功但轮次未开放（拿不到 csrfToken）——会话已建好，交回上层等开放
+                print('[i] 登录成功，选课轮次未开放')
+                return cli
             except CookieExpired:
                 break  # WebVPN 会话问题，走贴 Cookie 流程
             except Exception as e:
@@ -354,6 +372,13 @@ def relogin(cli, base, cfg=None):
             if cfg is not None:
                 cfg['cookie'] = dump_cookie(ncli)
                 save_config(cfg)  # 新 Cookie 写回配置，下次直接可用
+            return ncli
+        except RoundNotOpen:
+            # 登录成功但轮次未开放——新 Cookie 本身有效，写回配置后交回上层等开放
+            print('[i] 新 Cookie 有效，选课轮次未开放')
+            if cfg is not None:
+                cfg['cookie'] = dump_cookie(ncli)
+                save_config(cfg)
             return ncli
         except Exception as e:
             print(f'[!] 新 Cookie 登录失败: {e or type(e).__name__}，请重新复制粘贴')
@@ -400,9 +425,84 @@ def round_state(cli):
     return 'open', ''
 
 
+def wait_for_open(cli, base, cfg=None):
+    """轮次未开放：挂机探测直到开放（拿到 csrfToken）。
+    配置 open_at=下次开放时间时，先静默等到开放前 60 秒再 3 秒高频探测；
+    未配置则按 probe_gap（默认 10 秒）间隔探测。等待中会话过期走自动重登链。
+    返回 (True, cli) 或 (False, cli)"""
+    t_start = time.time()
+    open_at = str((cfg or {}).get('open_at') or '').strip()
+    t0 = None
+    if open_at:
+        try:
+            t0 = time.mktime(time.strptime(open_at, '%Y-%m-%d %H:%M:%S'))
+        except ValueError:
+            print('[!] open_at 格式应为 2026-09-17 11:00:00，忽略该配置')
+            open_at = ''
+    if t0:
+        try:
+            lead = max(1, int(float((cfg or {}).get('open_lead')))) if (cfg or {}).get('open_lead') else OPEN_LEAD
+        except (TypeError, ValueError):
+            lead = OPEN_LEAD
+        remain = t0 - lead - time.time()
+        if remain > 0:
+            lead_txt = f'{lead // 60} 分钟' if lead % 60 == 0 else f'{lead} 秒'
+            print(f'[等待] 轮次未开放，预计 {open_at} 开放；挂机 {int(remain)} 秒后'
+                  f'（提前 {lead_txt}）转 3 秒高频探测（Ctrl+C 可停）')
+            time.sleep(remain)
+        gap = 3
+    else:
+        raw = (cfg or {}).get('probe_gap')
+        try:
+            gap = max(1, int(float(raw))) if raw else 10
+        except (TypeError, ValueError):
+            gap = 10
+        print('[提示] 未配置 open_at。知道开放时间的话在 grab_config.json 加 '
+              '"open_at": "2026-09-17 11:00:00"，可挂机到开放前 1 分钟转 3 秒高频探测')
+    print(f'[等待] 每 {gap} 秒探测一次开放状态（Ctrl+C 可停）')
+    while True:
+        try:
+            cli.load_csrf(quiet=True)
+            print(f'\n[√] 轮次已开放（{time.strftime("%H:%M:%S")}），进入选课流程')
+            return True, cli
+        except RoundNotOpen:
+            w = int(time.time() - t_start)
+            print(f'  [{time.strftime("%H:%M:%S")}] 探测：尚未开放（已等待 {w // 60}分{w % 60:02d}秒）...')
+            time.sleep(gap)
+        except CookieExpired:
+            ncli = relogin(cli, base, cfg)
+            if ncli is None:
+                return False, cli
+            cli = ncli
+        except Exception as e:
+            print(f'  [{time.strftime("%H:%M:%S")}] 探测异常: {e or type(e).__name__}，继续...')
+            time.sleep(gap)
+
+
+def refresh_ready(cli, base, cfg=None):
+    """确保 csrfToken 可用：过期则重登、未开放则等开放。返回 cli 或 None（用户放弃）"""
+    while True:
+        try:
+            cli.load_csrf(quiet=True)
+            return cli
+        except RoundNotOpen:
+            ok, cli = wait_for_open(cli, base, cfg)
+            if not ok:
+                return None
+        except CookieExpired:
+            ncli = relogin(cli, base, cfg)
+            if ncli is None:
+                return None
+            cli = ncli
+            if cli.csrf:
+                return cli
+        except Exception:
+            time.sleep(3)
+
+
 def main():
     print('=' * 60)
-    print(' JLU 研究生选课助手 v2.1 （配置预置 + 一键全选）')
+    print(' JLU 研究生选课助手 v2.5 （配置预置 + 盯守抢课）')
     print('=' * 60)
     base = DEFAULT_BASE
     print('入口: WebVPN 模式（校园网内可改脚本顶部 INNER_BASE 直连）')
@@ -412,9 +512,23 @@ def main():
         print(f"\n[配置] 学号={cfg.get('username', '?')} 通道={cfg.get('lx', '0')} "
               f"目标={'列表全部课程' if cfg.get('pick') == 'all' else (cfg.get('pick') or '交互选序号')} "
               f"定时={cfg.get('at') or '立即'}")
-        c = input('回车=按配置运行 / e=重新配置: ').strip().lower()
+        c = input('回车=按配置运行 / e=重新配置 / o=设置开放时间（提前转高频探测）: ').strip().lower()
         if c == 'e':
             cfg = None
+        elif c == 'o':
+            oa = input('下次开放时间（2026-09-17 11:00:00，回车=不设置）: ').strip()
+            if not oa:
+                print('[i] 未输入，跳过设置（未开放时按 10 秒探测）')
+            else:
+                try:
+                    time.strptime(oa, '%Y-%m-%d %H:%M:%S')
+                except ValueError:
+                    print(f'[!] 格式不对：{oa}（应为 2026-09-17 11:00:00），本次不设置')
+                else:
+                    cfg['open_at'] = oa
+                    save_config(cfg)
+                    print(f'[√] open_at={oa} 已保存：未开放时将挂机至临近开放'
+                          f'（默认提前 5 分钟，可配 open_lead）转 3 秒高频探测')
 
     if cfg:
         cli = XsxkClient(base, cfg.get('cookie', ''),
@@ -428,6 +542,13 @@ def main():
                 print('[!] Cookie 已过期且配置无密码，无法自动重登（用 e 重新配置）')
                 return
             print('[!] Cookie 已过期，走自动恢复链...')
+        except RoundNotOpen as e:
+            print(f'[i] 登录态正常，但选课轮次未开放：{e}')
+            ok2, cli = wait_for_open(cli, base, cfg)
+            if ok2:
+                ok = True
+            else:
+                return
         except Exception as e:
             print(f'[!] 出错: {e or type(e).__name__}')
             return
@@ -437,6 +558,11 @@ def main():
             if ncli is None:
                 return
             cli = ncli
+            if not cli.csrf:
+                # 登录成功但轮次未开放（relogin 里拿不到 csrfToken）——挂机等开放
+                ok2, cli = wait_for_open(cli, base, cfg)
+                if not ok2:
+                    return
         lx = cfg.get('lx') or '0'
         pick = cfg.get('pick') or ''
         at = cfg.get('at') or ''
@@ -453,6 +579,12 @@ def main():
                 try:
                     cli.load_csrf()
                     break
+                except RoundNotOpen:
+                    oa = input('轮次未开放。预计开放时间（2026-09-17 11:00:00，回车=不知道，30 秒一探）: ').strip()
+                    ok2, cli = wait_for_open(cli, base, {'open_at': oa})
+                    if ok2:
+                        break
+                    return
                 except CookieExpired:
                     print('\n[!] Cookie 已过期/无效，请重新从浏览器复制（F12 -> Network -> Cookie 整行）')
                     cookie = paste_cookie()
@@ -494,6 +626,11 @@ def main():
                     time.sleep(2)
             try:
                 cli.load_csrf()
+            except RoundNotOpen:
+                oa = input('轮次未开放。预计开放时间（2026-09-17 11:00:00，回车=不知道，30 秒一探）: ').strip()
+                ok2, cli = wait_for_open(cli, base, {'open_at': oa})
+                if not ok2:
+                    return
             except Exception as e:
                 print(f'[!] 登录后拉取信息失败: {e}')
                 return
@@ -509,9 +646,10 @@ def main():
         if pick == 'a':
             pick = 'all'
         at = input('定时开抢（格式 2026-09-16 14:00:00，回车=立即）: ').strip()
+        open_at = input('预计下次开放时间（可选，格式 2026-09-17 11:00:00，回车=不填）: ').strip()
         if input('\n保存为配置文件 grab_config.json（下次一键运行）? [y/N]: ').strip().lower() == 'y':
             new_cfg = {'cookie': dump_cookie(cli), 'username': cli.username or '',
-                       'password': '', 'lx': lx, 'pick': pick, 'at': at}
+                       'password': '', 'lx': lx, 'pick': pick, 'at': at, 'open_at': open_at}
             if cli.username and input('  同时保存选课系统密码明文以便全自动重登? [y/N]: ').strip().lower() == 'y':
                 new_cfg['password'] = cli.password
                 print('  （注意: 密码明文存于本机 grab_config.json，勿外传）')
@@ -687,14 +825,11 @@ def main():
             #    提交前刷新 csrfToken：服务端会轮换 token，旧 token 会被拒“页面已过期”
             stopped = False
             if todo:
-                try:
-                    cli.load_csrf(quiet=True)
-                except CookieExpired:
-                    ncli = relogin(cli, base, cfg)
-                    if ncli is None:
-                        print('\n已停止。')
-                        break
-                    cli = ncli
+                ncli = refresh_ready(cli, base, cfg)
+                if ncli is None:
+                    print('\n已停止。')
+                    break
+                cli = ncli
             for bjdm, name in todo:
                 try:
                     print(f'\n[{time.strftime("%H:%M:%S")}] 提交选课: {name}')
@@ -711,14 +846,11 @@ def main():
                     if '过期' in str(e):
                         # token 失效信号：可恢复错误，刷新后重试，不计失败次数
                         print(f'  提交被拒（token 已轮换）: {e} —— 刷新 token 后重试')
-                        try:
-                            cli.load_csrf(quiet=True)
-                        except CookieExpired:
-                            ncli = relogin(cli, base, cfg)
-                            if ncli is None:
-                                stopped = True
-                                break
-                            cli = ncli
+                        ncli = refresh_ready(cli, base, cfg)
+                        if ncli is None:
+                            stopped = True
+                            break
+                        cli = ncli
                     else:
                         fails[bjdm] += 1
                         if fails[bjdm] <= max_retry:

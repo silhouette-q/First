@@ -1,8 +1,9 @@
 {
-  "cookie": "show_fast=1; heartbeat=1; show_faq=0; wengine_vpn_ticketvpn_jlu_edu_cn=d934a369e0d2c4e7; show_vpn=1; refresh=1",
+  "cookie": "show_fast=1; heartbeat=1; show_faq=0; show_vpn=1; wengine_vpn_ticketvpn_jlu_edu_cn=7461fc5bfdd0cbc0; refresh=1",
   "username": "2026532061",
   "password": "2026532061087814",
   "lx": "0",
   "pick": "all",
-  "at": ""
+  "at": "",
+  "open_at": "2026-09-17 11:00:00"
 }
